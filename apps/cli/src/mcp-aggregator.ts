@@ -19,7 +19,14 @@ import type { ServerClient } from "@mcp_router/shared";
 export class MCPAggregator {
   private server: Server;
   private clients: Map<string, ServerClient> = new Map();
-  private toolToServerMap: Map<string, string> = new Map();
+  private toolRoutingMap: Map<
+    string,
+    {
+      serverId: string;
+      serverName: string;
+      originalName: string;
+    }
+  > = new Map();
   private resourceProtocolMap: Map<string, string> = new Map();
 
   constructor() {
@@ -61,9 +68,9 @@ export class MCPAggregator {
     const serverClient = this.clients.get(id);
     if (serverClient) {
       // Clean up tool mappings for this server
-      for (const [toolName, serverId] of this.toolToServerMap) {
-        if (serverId === id) {
-          this.toolToServerMap.delete(toolName);
+      for (const [toolName, routingInfo] of this.toolRoutingMap) {
+        if (routingInfo.serverId === id) {
+          this.toolRoutingMap.delete(toolName);
         }
       }
       this.clients.delete(id);
@@ -128,7 +135,7 @@ export class MCPAggregator {
    */
   private async aggregateTools(): Promise<any[]> {
     const allTools: any[] = [];
-    this.toolToServerMap.clear();
+    this.toolRoutingMap.clear();
 
     // Collect tools from all clients in parallel
     const toolPromises = Array.from(this.clients.values()).map(
@@ -136,7 +143,11 @@ export class MCPAggregator {
         try {
           const response = await serverClient.client.listTools();
           if (response && Array.isArray(response.tools)) {
-            return { serverId: serverClient.id, tools: response.tools };
+            return {
+              serverId: serverClient.id,
+              serverName: serverClient.name,
+              tools: response.tools,
+            };
           }
         } catch (error) {
           console.error(
@@ -154,9 +165,25 @@ export class MCPAggregator {
     for (const result of results) {
       if (result) {
         for (const tool of result.tools) {
-          // Map tool to server
-          this.toolToServerMap.set(tool.name, result.serverId);
-          allTools.push(tool);
+          // Build prefixed tool name
+          const prefixedName = this.buildToolName(
+            result.serverName,
+            tool.name,
+          );
+
+          // Store routing information
+          this.toolRoutingMap.set(prefixedName, {
+            serverId: result.serverId,
+            serverName: result.serverName,
+            originalName: tool.name,
+          });
+
+          // Add tool with prefixed name
+          allTools.push({
+            ...tool,
+            name: prefixedName,
+            sourceServer: result.serverName,
+          });
         }
       }
     }
@@ -169,13 +196,13 @@ export class MCPAggregator {
    */
   private async callTool(params: any): Promise<any> {
     const { name, arguments: args } = params;
-    const serverId = this.toolToServerMap.get(name);
+    const routingInfo = this.toolRoutingMap.get(name);
 
-    if (!serverId) {
+    if (!routingInfo) {
       throw new McpError(ErrorCode.InvalidRequest, `Tool not found: ${name}`);
     }
 
-    const serverClient = this.clients.get(serverId);
+    const serverClient = this.clients.get(routingInfo.serverId);
     if (!serverClient) {
       throw new McpError(
         ErrorCode.InvalidRequest,
@@ -186,7 +213,7 @@ export class MCPAggregator {
     try {
       return await serverClient.client.callTool(
         {
-          name,
+          name: routingInfo.originalName,
           arguments: args || {},
         },
         undefined,
@@ -431,6 +458,28 @@ export class MCPAggregator {
     }
 
     throw new McpError(ErrorCode.InvalidRequest, `Prompt not found: ${name}`);
+  }
+
+  /**
+   * Build a prefixed tool name with server name
+   */
+  private buildToolName(serverName: string, toolName: string): string {
+    const baseName = `${serverName}__${toolName}`;
+
+    // Check if this name is already taken
+    if (!this.toolRoutingMap.has(baseName)) {
+      return baseName;
+    }
+
+    // Handle collisions by appending a counter
+    let counter = 2;
+    let candidate = `${baseName}__${counter}`;
+    while (this.toolRoutingMap.has(candidate)) {
+      counter += 1;
+      candidate = `${baseName}__${counter}`;
+    }
+
+    return candidate;
   }
 
   /**

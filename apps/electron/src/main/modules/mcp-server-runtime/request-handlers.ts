@@ -15,7 +15,16 @@ import { RequestHandlerBase } from "./request-handler-base";
  */
 export class RequestHandlers extends RequestHandlerBase {
   private originalProtocols: Map<string, string> = new Map();
-  private toolNameToServerMap: Map<string, Map<string, string>> = new Map();
+  private toolRoutingMap: Map<
+    string,
+    Map<
+      string,
+      {
+        serverName: string;
+        originalName: string;
+      }
+    >
+  > = new Map();
   private serverStatusMap: Map<string, boolean>;
   private servers: Map<string, MCPServer>;
   private clients: Map<string, Client>;
@@ -52,12 +61,20 @@ export class RequestHandlers extends RequestHandlerBase {
     return projectId ?? UNASSIGNED_PROJECT_ID;
   }
 
-  private ensureToolMap(projectId: string | null): Map<string, string> {
+  private ensureToolMap(
+    projectId: string | null,
+  ): Map<
+    string,
+    {
+      serverName: string;
+      originalName: string;
+    }
+  > {
     const key = this.getProjectKey(projectId);
-    let map = this.toolNameToServerMap.get(key);
+    let map = this.toolRoutingMap.get(key);
     if (!map) {
       map = new Map();
-      this.toolNameToServerMap.set(key, map);
+      this.toolRoutingMap.set(key, map);
     }
     return map;
   }
@@ -94,21 +111,21 @@ export class RequestHandlers extends RequestHandlerBase {
 
     const projectId = this.normalizeProjectId(request.params._meta?.projectId);
 
-    // Get server name and original tool name
+    // Get routing info (server name and original tool name)
     const token = request.params._meta?.token as string | undefined;
-    const mappedServerName = await this.getServerNameForTool(
+    const routingInfo = await this.getRoutingInfoForTool(
       toolName,
       token,
       projectId,
     );
-    if (!mappedServerName) {
+    if (!routingInfo) {
       throw new McpError(
         ErrorCode.InvalidRequest,
         `Could not determine server for tool: ${toolName}`,
       );
     }
-    const serverName = mappedServerName;
-    const originalToolName = toolName;
+    const serverName = routingInfo.serverName;
+    const originalToolName = routingInfo.originalName;
 
     // Validate token and get client ID for regular servers
     const clientId = this.tokenValidator.validateTokenAndAccess(
@@ -231,14 +248,24 @@ export class RequestHandlers extends RequestHandlerBase {
             continue;
           }
 
+          // Build prefixed tool name
+          const prefixedName = this.buildToolName(
+            serverName,
+            tool.name,
+            toolMap,
+          );
+
           const toolWithSource = {
             ...tool,
-            name: tool.name,
+            name: prefixedName,
             sourceServer: serverName,
           };
 
-          // Store the mapping
-          toolMap.set(tool.name, serverName);
+          // Store the routing information
+          toolMap.set(prefixedName, {
+            serverName,
+            originalName: tool.name,
+          });
 
           allTools.push(toolWithSource);
         }
@@ -661,23 +688,71 @@ export class RequestHandlers extends RequestHandlerBase {
   }
 
   /**
-   * Get server name for a given tool within the project scope
+   * Build a prefixed tool name with server name
+   */
+  private buildToolName(
+    serverName: string,
+    toolName: string,
+    toolMap: Map<
+      string,
+      {
+        serverName: string;
+        originalName: string;
+      }
+    >,
+  ): string {
+    const baseName = `${serverName}__${toolName}`;
+
+    // Check if this name is already taken
+    if (!toolMap.has(baseName)) {
+      return baseName;
+    }
+
+    // Handle collisions by appending a counter
+    let counter = 2;
+    let candidate = `${baseName}__${counter}`;
+    while (toolMap.has(candidate)) {
+      counter += 1;
+      candidate = `${baseName}__${counter}`;
+    }
+
+    return candidate;
+  }
+
+  /**
+   * Get routing info (server name and original tool name) for a given tool
+   */
+  private async getRoutingInfoForTool(
+    toolName: string,
+    token?: string,
+    projectId?: string | null,
+  ): Promise<{ serverName: string; originalName: string } | undefined> {
+    const normalizedProjectId = this.normalizeProjectId(projectId);
+    const projectKey = this.getProjectKey(normalizedProjectId);
+    let toolMap = this.toolRoutingMap.get(projectKey);
+
+    if (!toolMap || !toolMap.has(toolName)) {
+      await this.getAllToolsInternal(token, normalizedProjectId);
+      toolMap = this.toolRoutingMap.get(projectKey);
+    }
+
+    return toolMap?.get(toolName);
+  }
+
+  /**
+   * Get server name for a given tool within the project scope (legacy method for compatibility)
    */
   private async getServerNameForTool(
     toolName: string,
     token?: string,
     projectId?: string | null,
   ): Promise<string | undefined> {
-    const normalizedProjectId = this.normalizeProjectId(projectId);
-    const projectKey = this.getProjectKey(normalizedProjectId);
-    let toolMap = this.toolNameToServerMap.get(projectKey);
-
-    if (!toolMap || !toolMap.has(toolName)) {
-      await this.getAllToolsInternal(token, normalizedProjectId);
-      toolMap = this.toolNameToServerMap.get(projectKey);
-    }
-
-    return toolMap?.get(toolName);
+    const routingInfo = await this.getRoutingInfoForTool(
+      toolName,
+      token,
+      projectId,
+    );
+    return routingInfo?.serverName;
   }
 
   public getServerIdByName(name: string): string | undefined {
